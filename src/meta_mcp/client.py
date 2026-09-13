@@ -8,6 +8,7 @@ from typing import Any, Final
 import httpx
 
 from .constants import GRAPH_API_BASE, THREADS_API_BASE, TIMEOUT_SECONDS
+from .errors import MetaMCPError
 
 JSONDict = dict[str, Any]
 
@@ -18,11 +19,11 @@ _TOKEN_ERROR: Final[str] = (
 )
 
 
-class GraphAPIError(RuntimeError):
+class GraphAPIError(MetaMCPError, RuntimeError):
     """Erreur renvoyée par la Graph API."""
 
 
-class WritesDisabledError(RuntimeError):
+class WritesDisabledError(MetaMCPError, RuntimeError):
     """Une écriture a été tentée alors que le mode écriture est désactivé."""
 
 

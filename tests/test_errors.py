@@ -12,9 +12,10 @@ import respx
 from mcp import Client
 from mcp.server.mcpserver.exceptions import ToolError
 
+from meta_mcp.client import GraphAPIError, WritesDisabledError
 from meta_mcp.config import Settings
 from meta_mcp.constants import GRAPH_API_BASE
-from meta_mcp.errors import ToolInputError
+from meta_mcp.errors import ContainerNotReadyError, OperationError, ToolInputError
 from meta_mcp.server import build_server
 
 
@@ -23,6 +24,16 @@ async def server():
     mcp, client = build_server(Settings(access_token="fake-token", enable_writes=True))
     yield mcp
     await client.aclose()
+
+
+@pytest.mark.parametrize(
+    "error_class",
+    [GraphAPIError, WritesDisabledError, ToolInputError, OperationError, ContainerNotReadyError],
+)
+def test_anticipated_errors_are_sdk_tool_errors(error_class):
+    """Régression (CI avec mcp 2.2) : seul le message d'un `ToolError` parvient au
+    modèle ; toute autre exception est masquée derrière « Error executing tool <nom> »."""
+    assert issubclass(error_class, ToolError)
 
 
 INVALID_CALLS = [

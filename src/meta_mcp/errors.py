@@ -11,14 +11,25 @@ synthèse.
 
 from __future__ import annotations
 
+from ._compat import ToolError
+
 _RETRY_LATER = "IN_PROGRESS", "TIMEOUT"
 
 
-class ToolInputError(ValueError):
+class MetaMCPError(ToolError):
+    """Échec anticipé d'un outil.
+
+    Hériter de `ToolError` est indispensable : le SDK MCP (>= 2.2) ne transmet au
+    modèle que le message d'un `ToolError`. Toute autre exception est traitée comme
+    un plantage, et le modèle ne lit plus que « Error executing tool <nom> ».
+    """
+
+
+class ToolInputError(MetaMCPError, ValueError):
     """Paramètre invalide : rien n'a été envoyé à Meta."""
 
 
-class OperationError(RuntimeError):
+class OperationError(MetaMCPError, RuntimeError):
     """Une opération Meta a été lancée mais n'a pas abouti."""
 
 
