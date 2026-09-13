@@ -125,6 +125,7 @@ SHA-256 localement** avant tout envoi : Meta ne reçoit jamais de donnée en cla
 `delete_page_post` · `reply_to_comment` · `ig_publish_image` · `ig_publish_carousel`
 `ig_publish_image_from_file` · `ig_publish_carousel_from_files`
 `ig_publish_reel` · `ig_publish_reel_from_file` · `ig_container_status`
+`ig_publish_container`
 `ig_reply_to_comment` · `ig_delete_comment`
 `ig_publishing_limit` · `publish_thread`
 
@@ -153,8 +154,12 @@ réutilisée pour l'ingestion du reel, puis la vidéo intermédiaire est supprim
 
 - l'upload direct est plafonné à `MAX_DIRECT_UPLOAD_BYTES` (200 Mo) ; au-delà,
   Meta impose son protocole d'upload repris, non implémenté ici ;
-- l'encodage d'un reel est lent — l'attente va jusqu'à 5 minutes, après quoi
-  l'outil renvoie le `container_id` à surveiller avec `ig_container_status`.
+- l'encodage d'un reel est lent — l'attente va jusqu'à 5 minutes. Au-delà, l'outil
+  échoue en donnant le `container_id` et **conserve** la vidéo intermédiaire,
+  qu'Instagram peut encore être en train de lire : suis le conteneur avec
+  `ig_container_status`, publie-le avec `ig_publish_container`, puis supprime la
+  vidéo avec `delete_page_post`. En cas d'échec définitif (conteneur refusé,
+  publication rejetée), la vidéo intermédiaire est supprimée.
 
 Instagram attend un reel en 9:16. Une vidéo 4:5 ou carrée est acceptée mais
 recadrée ou encadrée à l'affichage.
@@ -181,8 +186,12 @@ mypy src
 
 Les noms de métriques Meta évoluent d'une version d'API à l'autre. Ils sont
 regroupés dans `src/meta_mcp/constants.py` — un seul endroit à ajuster.
-Les outils de statistiques renvoient un champ `errors` listant les métriques
-indisponibles plutôt que d'échouer complètement.
+
+Un outil qui ne peut pas aboutir (paramètre invalide, fichier introuvable,
+conteneur Instagram refusé…) lève une erreur : le client MCP la reçoit avec
+`isError: true`. Les résultats partiels, eux, ne sont pas des erreurs : les outils
+de statistiques renvoient un champ `errors` listant les métriques indisponibles
+plutôt que d'échouer complètement.
 
 ## Licence
 

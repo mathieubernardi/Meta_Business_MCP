@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, timedelta
 from typing import Any
 
+import httpx
+
 from .._compat import MCPServer
-from ..client import MetaClient
+from ..client import GraphAPIError, MetaClient
 from ..constants import (
     FB_PAGE_DAILY_METRICS,
     IG_ACCOUNT_DAILY_METRICS,
@@ -14,9 +17,15 @@ from ..constants import (
     IG_MEDIA_FIELDS,
     IG_MEDIA_METRICS,
 )
+from ..errors import ToolInputError
 from .instagram import resolve_ig_user_id
 
 JSONDict = dict[str, Any]
+
+# Taille de l'échantillon classé par `top_ig_posts`, et nombre d'appels
+# d'insights menés en parallèle (assez bas pour ménager les quotas Meta).
+_TOP_POSTS_SAMPLE = 50
+_INSIGHTS_CONCURRENCY = 5
 
 
 def _sum_series(values: list[JSONDict]) -> int:
@@ -96,12 +105,16 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
         `sort_by` : reach, likes, comments, saved, shares ou total_interactions.
         """
         if sort_by not in IG_MEDIA_METRICS:
-            return {"error": f"sort_by doit être parmi {list(IG_MEDIA_METRICS)}"}
+            raise ToolInputError(f"sort_by doit être parmi {list(IG_MEDIA_METRICS)}")
         media = await client.paginate(
-            f"{ig_user_id}/media", {"fields": IG_MEDIA_FIELDS, "limit": 50}
+            f"{ig_user_id}/media",
+            {"fields": IG_MEDIA_FIELDS, "limit": _TOP_POSTS_SAMPLE},
+            max_items=_TOP_POSTS_SAMPLE,
         )
-        rows: list[JSONDict] = []
-        for item in media[:50]:
+        metrics = ",".join(IG_MEDIA_METRICS)
+        semaphore = asyncio.Semaphore(_INSIGHTS_CONCURRENCY)
+
+        async def ranked_row(item: JSONDict) -> JSONDict:
             row: JSONDict = {
                 "id": item.get("id"),
                 "timestamp": item.get("timestamp"),
@@ -110,14 +123,18 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
                 "caption": (item.get("caption") or "")[:120],
             }
             try:
-                insights = await client.get(
-                    f"{item['id']}/insights", {"metric": ",".join(IG_MEDIA_METRICS)}
-                )
-                for entry in insights.get("data", []):
-                    row[entry["name"]] = (entry.get("values") or [{}])[0].get("value")
-            except Exception:  # noqa: BLE001 - média sans insights (trop ancien)
-                pass
-            rows.append(row)
+                async with semaphore:
+                    insights = await client.get(f"{item['id']}/insights", {"metric": metrics})
+            except (GraphAPIError, httpx.HTTPError) as exc:
+                # Média sans statistiques (souvent trop ancien) : classé, mais signalé,
+                # sinon il passerait pour un média à portée nulle.
+                row["insights_error"] = str(exc)
+                return row
+            for entry in insights.get("data", []):
+                row[entry["name"]] = (entry.get("values") or [{}])[0].get("value")
+            return row
+
+        rows = list(await asyncio.gather(*(ranked_row(item) for item in media)))
         rows.sort(key=lambda r: r.get(sort_by) or 0, reverse=True)
         return {"sorted_by": sort_by, "count": len(rows), "top": rows[:limit]}
 

@@ -14,6 +14,7 @@ from ..constants import (
     IG_MEDIA_METRICS,
     IG_STORY_METRICS,
 )
+from ..errors import ToolInputError
 
 JSONDict = dict[str, Any]
 
@@ -54,8 +55,9 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
         media = await client.paginate(
             f"{ig_user_id}/media",
             {"fields": IG_MEDIA_FIELDS, "limit": min(limit, 100)},
+            max_items=limit,
         )
-        return {"count": len(media), "media": media[:limit]}
+        return {"count": len(media), "media": media}
 
     @mcp.tool()
     async def get_ig_media(media_id: str) -> JSONDict:
@@ -113,7 +115,9 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
     ) -> JSONDict:
         """Démographie des abonnés Instagram (âge/genre, pays ou ville)."""
         if breakdown not in IG_DEMOGRAPHIC_BREAKDOWNS:
-            return {"error": f"breakdown doit être parmi {list(IG_DEMOGRAPHIC_BREAKDOWNS)}"}
+            raise ToolInputError(
+                f"breakdown doit être parmi {list(IG_DEMOGRAPHIC_BREAKDOWNS)}"
+            )
         data = await client.get(
             f"{ig_user_id}/insights",
             {
@@ -150,5 +154,6 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
         comments = await client.paginate(
             f"{media_id}/comments",
             {"fields": "id,text,username,timestamp,like_count", "limit": min(limit, 100)},
+            max_items=limit,
         )
-        return {"count": len(comments), "comments": comments[:limit]}
+        return {"count": len(comments), "comments": comments}

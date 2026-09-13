@@ -81,6 +81,25 @@ class MetaClient:
                 "Garde-fou volontaire pour éviter toute publication accidentelle."
             )
 
+    def _auth_headers(self, token: str | None) -> dict[str, str]:
+        """En-tête d'authentification.
+
+        Le token ne passe jamais dans l'URL : httpx journalise chaque URL au niveau
+        INFO, et les clients MCP conservent souvent stderr dans des fichiers de log.
+        """
+        if token is None:
+            self.require_token()
+        return {"Authorization": f"Bearer {token or self._user_token}"}
+
+    @staticmethod
+    def _form_fields(data: JSONDict | None) -> dict[str, str]:
+        """Champs de formulaire : valeurs None ignorées, le reste converti en texte."""
+        return {
+            key: value if isinstance(value, str) else str(value)
+            for key, value in (data or {}).items()
+            if value is not None
+        }
+
     @staticmethod
     def _raise_for_payload(response: httpx.Response) -> JSONDict:
         try:
@@ -106,10 +125,10 @@ class MetaClient:
         base: str = GRAPH_API_BASE,
     ) -> JSONDict:
         """GET sur la Graph API."""
-        if token is None:
-            self.require_token()
-        query: JSONDict = {"access_token": token or self._user_token, **(params or {})}
-        response = await self._http.get(f"{base}/{path.lstrip('/')}", params=query)
+        headers = self._auth_headers(token)
+        response = await self._http.get(
+            f"{base}/{path.lstrip('/')}", params=params, headers=headers
+        )
         return self._raise_for_payload(response)
 
     async def post(
@@ -121,14 +140,10 @@ class MetaClient:
         base: str = GRAPH_API_BASE,
     ) -> JSONDict:
         """POST sur la Graph API (création, publication)."""
-        if token is None:
-            self.require_token()
-        body: dict[str, str] = {"access_token": token or self._user_token}
-        for key, value in (data or {}).items():
-            if value is None:
-                continue
-            body[key] = value if isinstance(value, str) else str(value)
-        response = await self._http.post(f"{base}/{path.lstrip('/')}", data=body)
+        headers = self._auth_headers(token)
+        response = await self._http.post(
+            f"{base}/{path.lstrip('/')}", data=self._form_fields(data), headers=headers
+        )
         return self._raise_for_payload(response)
 
     async def post_multipart(
@@ -146,17 +161,12 @@ class MetaClient:
         `timeout` permet d'allonger le délai pour les gros fichiers (vidéo),
         le client étant configuré par défaut sur un délai court.
         """
-        if token is None:
-            self.require_token()
-        body: dict[str, str] = {"access_token": token or self._user_token}
-        for key, value in (data or {}).items():
-            if value is None:
-                continue
-            body[key] = value if isinstance(value, str) else str(value)
+        headers = self._auth_headers(token)
         response = await self._http.post(
             f"{base}/{path.lstrip('/')}",
-            data=body,
+            data=self._form_fields(data),
             files=files,
+            headers=headers,
             timeout=timeout if timeout is not None else TIMEOUT_SECONDS,
         )
         return self._raise_for_payload(response)
@@ -170,11 +180,9 @@ class MetaClient:
         base: str = GRAPH_API_BASE,
     ) -> JSONDict:
         """DELETE sur la Graph API."""
-        if token is None:
-            self.require_token()
-        query: JSONDict = {"access_token": token or self._user_token, **(params or {})}
+        headers = self._auth_headers(token)
         response = await self._http.request(
-            "DELETE", f"{base}/{path.lstrip('/')}", params=query
+            "DELETE", f"{base}/{path.lstrip('/')}", params=params, headers=headers
         )
         return self._raise_for_payload(response)
 
@@ -184,25 +192,30 @@ class MetaClient:
         params: JSONDict | None = None,
         *,
         token: str | None = None,
+        max_items: int | None = None,
         max_pages: int = 10,
     ) -> list[JSONDict]:
-        """Suit la pagination `paging.next` et agrège les résultats."""
+        """Suit la pagination `paging.next` et agrège les résultats.
+
+        S'arrête dès que `max_items` éléments sont réunis, sans charger de page
+        inutile. Une page en erreur fait échouer l'appel : un résultat tronqué
+        sans le dire serait pris pour complet.
+        """
         rows: list[JSONDict] = []
         page = await self.get(path, params, token=token)
         rows.extend(page.get("data", []))
         pages = 1
-        while pages < max_pages:
+        while pages < max_pages and (max_items is None or len(rows) < max_items):
             nxt = page.get("paging", {}).get("next")
             if not nxt:
                 break
-            response = await self._http.get(nxt)
-            try:
-                page = self._raise_for_payload(response)
-            except GraphAPIError:
-                break
+            # Meta embarque le token dans `paging.next` : on le retire, l'en-tête suffit.
+            next_url = httpx.URL(nxt).copy_remove_param("access_token")
+            response = await self._http.get(next_url, headers=self._auth_headers(token))
+            page = self._raise_for_payload(response)
             rows.extend(page.get("data", []))
             pages += 1
-        return rows
+        return rows if max_items is None else rows[:max_items]
 
     async def page_token(self, page_id: str) -> str:
         """Renvoie (et met en cache) le token d'une Page."""

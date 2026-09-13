@@ -51,8 +51,9 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
             f"{page_id}/posts",
             {"fields": POST_FIELDS, "limit": min(limit, 100)},
             token=token,
+            max_items=limit,
         )
-        return {"count": len(posts), "posts": posts[:limit]}
+        return {"count": len(posts), "posts": posts}
 
     @mcp.tool()
     async def get_post(post_id: str) -> JSONDict:
@@ -65,8 +66,9 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
         comments = await client.paginate(
             f"{post_id}/comments",
             {"fields": "id,from,message,created_time,like_count", "limit": min(limit, 100)},
+            max_items=limit,
         )
-        return {"count": len(comments), "comments": comments[:limit]}
+        return {"count": len(comments), "comments": comments}
 
     @mcp.tool()
     async def get_page_insights(
