@@ -2,6 +2,9 @@
 
 Tous ces outils passent par `client.require_writes()` : sans
 `META_ENABLE_WRITES=true`, ils refusent de s'exécuter.
+
+Un outil qui ne peut pas aboutir lève une exception (voir `meta_mcp.errors`) :
+le client MCP la reçoit avec `isError: true`.
 """
 
 from __future__ import annotations
@@ -12,9 +15,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from .._compat import MCPServer
-from ..client import MetaClient
+from ..client import GraphAPIError, MetaClient
 from ..constants import MAX_DIRECT_UPLOAD_BYTES, UPLOAD_TIMEOUT_SECONDS
+from ..errors import ContainerNotReadyError, OperationError, ToolInputError
 
 JSONDict = dict[str, Any]
 
@@ -27,17 +33,79 @@ MIN_SCHEDULE_DELAY_SECONDS = 10 * 60
 MAX_SCHEDULE_DELAY_SECONDS = 180 * 24 * 60 * 60
 
 
+def _check_schedule(scheduled_publish_time: int) -> None:
+    """Vérifie les bornes de programmation imposées par Meta."""
+    delay = scheduled_publish_time - int(time.time())
+    if delay < MIN_SCHEDULE_DELAY_SECONDS:
+        raise ToolInputError(
+            f"date de programmation trop proche ({delay} s d'avance) : "
+            "Meta impose au moins 10 minutes d'avance"
+        )
+    if delay > MAX_SCHEDULE_DELAY_SECONDS:
+        raise ToolInputError(
+            f"date de programmation trop lointaine ({delay} s d'avance) : "
+            "Meta impose au plus 6 mois d'avance"
+        )
+
+
+def _check_carousel_size(count: int) -> None:
+    if not 2 <= count <= 10:
+        raise ToolInputError("un carrousel Instagram accepte entre 2 et 10 images")
+
+
+def _check_page_carousel_size(count: int) -> None:
+    if count == 0:
+        raise ToolInputError("un carrousel Facebook demande au moins une image")
+
+
+def _local_file(file_path: str) -> Path:
+    """Chemin d'un fichier local existant."""
+    path = Path(file_path)
+    if not path.is_file():
+        raise ToolInputError(f"fichier introuvable : {file_path}")
+    return path
+
+
+async def _container_status(client: MetaClient, container_id: str) -> str:
+    data = await client.get(container_id, {"fields": "status_code,status"})
+    return str(data.get("status_code", "")).upper()
+
+
 async def _wait_for_container(
     client: MetaClient, container_id: str, max_polls: int = _MAX_STATUS_POLLS
 ) -> str:
     """Attend qu'un conteneur Instagram soit prêt. Renvoie son statut final."""
     for _ in range(max_polls):
-        data = await client.get(container_id, {"fields": "status_code,status"})
-        status = str(data.get("status_code", "")).upper()
+        status = await _container_status(client, container_id)
         if status in {"FINISHED", "ERROR", "EXPIRED"}:
             return status
         await asyncio.sleep(_POLL_DELAY_SECONDS)
     return "TIMEOUT"
+
+
+async def _create_container(client: MetaClient, ig_user_id: str, params: JSONDict) -> str:
+    """Crée un conteneur Instagram et renvoie son id."""
+    container = await client.post(f"{ig_user_id}/media", params)
+    container_id = str(container.get("id", ""))
+    if not container_id:
+        raise OperationError(f"création du conteneur Instagram échouée : {container}")
+    return container_id
+
+
+async def _publish_container(
+    client: MetaClient,
+    ig_user_id: str,
+    container_id: str,
+    max_polls: int = _MAX_STATUS_POLLS,
+) -> JSONDict:
+    """Attend qu'un conteneur Instagram soit prêt, puis le publie."""
+    status = await _wait_for_container(client, container_id, max_polls)
+    if status != "FINISHED":
+        raise ContainerNotReadyError(container_id, status)
+    published = await client.post(
+        f"{ig_user_id}/media_publish", {"creation_id": container_id}
+    )
+    return {"published": published, "container_id": container_id}
 
 
 async def _wait_for_page_video_source(
@@ -52,8 +120,7 @@ async def _wait_for_page_video_source(
     demeure vide tant que Meta n'a pas terminé l'encodage — d'où les échecs
     « URL introuvable » quand on l'exploite trop tôt pour l'ingestion Instagram.
     On interroge `status.video_status` jusqu'à `ready`, puis on renvoie le
-    payload complet (`source`, `permalink_url`). En cas d'erreur d'encodage ou
-    de dépassement du délai, on renvoie un dict contenant une clé `error`.
+    payload complet (`source`, `permalink_url`).
     """
     last: JSONDict = {}
     for _ in range(max_polls):
@@ -65,9 +132,23 @@ async def _wait_for_page_video_source(
         if video_status == "ready" and last.get("source"):
             return last
         if video_status == "error":
-            return {"error": "encodage de la vidéo en erreur", "detail": status}
+            raise OperationError(f"encodage de la vidéo {video_id} en erreur : {status}")
         await asyncio.sleep(_POLL_DELAY_SECONDS)
-    return {"error": "délai d'encodage dépassé", "detail": last}
+    raise OperationError(
+        f"délai d'encodage dépassé pour la vidéo {video_id} "
+        f"(dernier statut : {last.get('status')})"
+    )
+
+
+async def _delete_intermediate_video(
+    client: MetaClient, video_id: str, token: str
+) -> JSONDict:
+    """Supprime la vidéo intermédiaire d'un reel, sans masquer l'issue de la publication."""
+    try:
+        await client.delete(video_id, token=token)
+    except (GraphAPIError, httpx.HTTPError) as exc:
+        return {"uploaded_fb_video_deleted": False, "cleanup_error": str(exc)}
+    return {"uploaded_fb_video_deleted": True}
 
 
 async def _upload_unpublished_photo(
@@ -80,9 +161,7 @@ async def _upload_unpublished_photo(
     Instagram (`image_url`) — pas besoin d'hébergement externe pour les
     carrousels ou images IG construits à partir de fichiers locaux.
     """
-    path = Path(file_path)
-    if not path.is_file():
-        return {"error": f"fichier introuvable : {file_path}"}
+    path = _local_file(file_path)
     content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     uploaded = await client.post_multipart(
         f"{page_id}/photos",
@@ -92,7 +171,7 @@ async def _upload_unpublished_photo(
     )
     media_id = str(uploaded.get("id", ""))
     if not media_id:
-        return {"error": "téléversement échoué", "detail": uploaded}
+        raise OperationError(f"téléversement de {path.name} échoué : {uploaded}")
     detail = await client.get(media_id, {"fields": "images"}, token=token)
     images = detail.get("images") or []
     url = images[0].get("source") if images else None
@@ -109,26 +188,21 @@ async def _upload_page_video(
     published: bool = False,
     scheduled_publish_time: int | None = None,
 ) -> JSONDict:
-    """Téléverse une vidéo locale sur la Page et renvoie son id et son URL source.
+    """Téléverse une vidéo locale sur la Page et renvoie son id.
 
-    Même astuce que pour les photos : une vidéo téléversée non publiée expose
-    une URL `source` exploitable par l'ingestion Instagram, ce qui évite tout
-    hébergement externe. Cette URL est signée et temporaire — elle doit être
-    consommée immédiatement, pas stockée.
+    Même astuce que pour les photos : une vidéo téléversée non publiée expose,
+    une fois encodée, une URL `source` exploitable par l'ingestion Instagram
+    (voir `_wait_for_page_video_source`). Cette URL est signée et temporaire —
+    elle doit être consommée immédiatement, pas stockée.
     """
-    path = Path(file_path)
-    if not path.is_file():
-        return {"error": f"fichier introuvable : {file_path}"}
+    path = _local_file(file_path)
     size = path.stat().st_size
     if size > MAX_DIRECT_UPLOAD_BYTES:
-        return {
-            "error": (
-                f"fichier trop volumineux pour un upload direct : "
-                f"{size / 1024 / 1024:.1f} Mo > "
-                f"{MAX_DIRECT_UPLOAD_BYTES / 1024 / 1024:.0f} Mo"
-            ),
-            "hint": "découpe la vidéo ou passe par le protocole d'upload repris de Meta",
-        }
+        raise ToolInputError(
+            f"fichier trop volumineux pour un upload direct : "
+            f"{size / 1024 / 1024:.1f} Mo > {MAX_DIRECT_UPLOAD_BYTES / 1024 / 1024:.0f} Mo "
+            "— découpe la vidéo ou passe par le protocole d'upload repris de Meta"
+        )
     payload: JSONDict = {"description": description}
     if scheduled_publish_time is not None:
         # Une vidéo programmée est déposée non publiée : Meta la publie à l'heure dite.
@@ -146,33 +220,37 @@ async def _upload_page_video(
     )
     video_id = str(uploaded.get("id", ""))
     if not video_id:
-        return {"error": "téléversement échoué", "detail": uploaded}
+        raise OperationError(f"téléversement de {path.name} échoué : {uploaded}")
 
-    # Une vidéo programmée n'a pas besoin de son URL `source` (elle sera publiée
-    # par Meta à l'heure dite) : on évite l'attente d'encodage inutile.
+    result: JSONDict = {"id": video_id, "url": None, "permalink_url": None, "bytes": size}
     if scheduled_publish_time is not None:
-        detail = await client.get(
-            video_id, {"fields": "permalink_url"}, token=token
-        )
-        return {
-            "id": video_id,
-            "url": None,
-            "permalink_url": detail.get("permalink_url"),
-            "bytes": size,
-            "scheduled_publish_time": scheduled_publish_time,
-        }
+        result["scheduled_publish_time"] = scheduled_publish_time
+    elif not published:
+        # Non publiée : l'URL `source` n'existe qu'après encodage ; l'appelant
+        # l'attend s'il en a besoin.
+        return result
 
-    # Cas immédiat (notamment l'alimentation d'un reel Instagram) : on attend que
-    # l'encodage soit terminé pour disposer d'une URL `source` exploitable.
-    ready = await _wait_for_page_video_source(client, video_id, token)
-    if ready.get("error"):
-        return {"id": video_id, "url": None, "bytes": size, **ready}
-    return {
-        "id": video_id,
-        "url": ready.get("source"),
-        "permalink_url": ready.get("permalink_url"),
-        "bytes": size,
-    }
+    # Publiée ou programmée : Meta a pris la vidéo en charge. Attendre l'encodage
+    # pourrait transformer un envoi réussi en erreur et pousser à republier
+    # (doublon) — on lit les détails une seule fois, sans jamais échouer.
+    try:
+        detail = await client.get(video_id, {"fields": "source,permalink_url"}, token=token)
+    except (GraphAPIError, httpx.HTTPError):
+        return result
+    result["url"] = detail.get("source")
+    result["permalink_url"] = detail.get("permalink_url")
+    return result
+
+
+async def _post_with_attached_media(
+    client: MetaClient, page_id: str, message: str, media_ids: list[str], token: str
+) -> JSONDict:
+    """Publie un post de Page rattachant des photos déjà téléversées non publiées."""
+    payload: JSONDict = {"message": message}
+    for index, media_id in enumerate(media_ids):
+        payload[f"attached_media[{index}]"] = f'{{"media_fbid":"{media_id}"}}'
+    result = await client.post(f"{page_id}/feed", payload, token=token)
+    return {"post": result, "uploaded_media": media_ids}
 
 
 def register(mcp: MCPServer, client: MetaClient) -> None:
@@ -189,15 +267,20 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
     ) -> JSONDict:
         """Publie un message texte (ou avec lien) sur une Page Facebook.
 
-        Pour programmer : `published=False` + `scheduled_publish_time`
-        (horodatage Unix, entre 10 min et 6 mois dans le futur).
+        Pour programmer : `scheduled_publish_time` (horodatage Unix UTC, entre
+        10 minutes et 6 mois dans le futur) ; Meta publie alors le post à l'heure
+        dite, quelle que soit la valeur de `published`. `published=False` sans date
+        crée un post non publié, absent du fil.
         """
         client.require_writes("publish_page_post")
-        token = await client.page_token(page_id)
         payload: JSONDict = {"message": message, "link": link}
-        if not published:
+        if scheduled_publish_time is not None:
+            _check_schedule(scheduled_publish_time)
             payload["published"] = "false"
             payload["scheduled_publish_time"] = scheduled_publish_time
+        elif not published:
+            payload["published"] = "false"
+        token = await client.page_token(page_id)
         return await client.post(f"{page_id}/feed", payload, token=token)
 
     @mcp.tool()
@@ -224,20 +307,17 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
         Les images sont d'abord téléversées non publiées, puis rattachées au post.
         """
         client.require_writes("publish_page_carousel")
+        _check_page_carousel_size(len(image_urls))
         token = await client.page_token(page_id)
         media_ids: list[str] = []
         for url in image_urls:
             uploaded = await client.post(
                 f"{page_id}/photos", {"url": url, "published": "false"}, token=token
             )
-            media_id = uploaded.get("id")
-            if media_id:
-                media_ids.append(str(media_id))
-        payload: JSONDict = {"message": message}
-        for index, media_id in enumerate(media_ids):
-            payload[f"attached_media[{index}]"] = f'{{"media_fbid":"{media_id}"}}'
-        result = await client.post(f"{page_id}/feed", payload, token=token)
-        return {"post": result, "uploaded_media": media_ids}
+            if not uploaded.get("id"):
+                raise OperationError(f"téléversement de l'image échoué : {url} ({uploaded})")
+            media_ids.append(str(uploaded["id"]))
+        return await _post_with_attached_media(client, page_id, message, media_ids, token)
 
     @mcp.tool()
     async def publish_page_photo_from_file(
@@ -249,9 +329,7 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
         """Publie une photo sur une Page Facebook depuis un fichier local (upload direct)."""
         client.require_writes("publish_page_photo_from_file")
         token = await client.page_token(page_id)
-        path = Path(file_path)
-        if not path.is_file():
-            return {"error": f"fichier introuvable : {file_path}"}
+        path = _local_file(file_path)
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         data: JSONDict = {"caption": caption}
         if not published:
@@ -273,18 +351,13 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
         `publish_page_carousel` mais sans passer par des URLs publiques.
         """
         client.require_writes("publish_page_carousel_from_files")
+        _check_page_carousel_size(len(file_paths))
         token = await client.page_token(page_id)
         media_ids: list[str] = []
         for file_path in file_paths:
             uploaded = await _upload_unpublished_photo(client, page_id, file_path, token)
-            if not uploaded.get("id"):
-                return {"error": f"téléversement échoué : {file_path}", "detail": uploaded}
             media_ids.append(uploaded["id"])
-        payload: JSONDict = {"message": message}
-        for index, media_id in enumerate(media_ids):
-            payload[f"attached_media[{index}]"] = f'{{"media_fbid":"{media_id}"}}'
-        result = await client.post(f"{page_id}/feed", payload, token=token)
-        return {"post": result, "uploaded_media": media_ids}
+        return await _post_with_attached_media(client, page_id, message, media_ids, token)
 
     @mcp.tool()
     async def publish_page_video_from_file(
@@ -307,21 +380,9 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
         """
         client.require_writes("publish_page_video_from_file")
         if scheduled_publish_time is not None:
-            delay = scheduled_publish_time - int(time.time())
-            if delay < MIN_SCHEDULE_DELAY_SECONDS:
-                return {
-                    "error": "date de programmation trop proche",
-                    "hint": "Meta impose au moins 10 minutes d'avance",
-                    "seconds_ahead": delay,
-                }
-            if delay > MAX_SCHEDULE_DELAY_SECONDS:
-                return {
-                    "error": "date de programmation trop lointaine",
-                    "hint": "Meta impose au plus 6 mois d'avance",
-                    "seconds_ahead": delay,
-                }
+            _check_schedule(scheduled_publish_time)
         token = await client.page_token(page_id)
-        return await _upload_page_video(
+        uploaded = await _upload_page_video(
             client,
             page_id,
             file_path,
@@ -330,6 +391,13 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
             published=published,
             scheduled_publish_time=scheduled_publish_time,
         )
+        if not published and scheduled_publish_time is None:
+            # Vidéo non publiée : on attend son encodage pour exposer une URL
+            # `source` réutilisable, par exemple pour alimenter un reel Instagram.
+            ready = await _wait_for_page_video_source(client, uploaded["id"], token)
+            uploaded["url"] = ready.get("source")
+            uploaded["permalink_url"] = ready.get("permalink_url")
+        return uploaded
 
     @mcp.tool()
     async def delete_page_post(post_id: str) -> JSONDict:
@@ -350,18 +418,10 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
     ) -> JSONDict:
         """Publie une image sur Instagram depuis une URL publique (JPEG)."""
         client.require_writes("ig_publish_image")
-        container = await client.post(
-            f"{ig_user_id}/media", {"image_url": image_url, "caption": caption}
+        container_id = await _create_container(
+            client, ig_user_id, {"image_url": image_url, "caption": caption}
         )
-        container_id = str(container.get("id", ""))
-        status = await _wait_for_container(client, container_id)
-        if status != "FINISHED":
-            return {"error": f"conteneur non prêt (statut {status})",
-                    "container_id": container_id}
-        published = await client.post(
-            f"{ig_user_id}/media_publish", {"creation_id": container_id}
-        )
-        return {"published": published, "container_id": container_id}
+        return await _publish_container(client, ig_user_id, container_id)
 
     @mcp.tool()
     async def ig_publish_image_from_file(
@@ -376,8 +436,10 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
         client.require_writes("ig_publish_image_from_file")
         token = await client.page_token(page_id)
         uploaded = await _upload_unpublished_photo(client, page_id, file_path, token)
-        if not uploaded.get("url"):
-            return {"error": "téléversement échoué ou URL introuvable", "detail": uploaded}
+        if not uploaded["url"]:
+            raise OperationError(
+                f"URL CDN introuvable pour la photo téléversée {uploaded['id']} ({file_path})"
+            )
         result = await ig_publish_image(ig_user_id, uploaded["url"], caption)
         result["uploaded_fb_photo"] = uploaded["id"]
         return result
@@ -388,32 +450,23 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
     ) -> JSONDict:
         """Publie un carrousel Instagram (2 à 10 images, URLs publiques JPEG)."""
         client.require_writes("ig_publish_carousel")
-        if not 2 <= len(image_urls) <= 10:
-            return {"error": "un carrousel Instagram accepte entre 2 et 10 images"}
+        _check_carousel_size(len(image_urls))
         children: list[str] = []
         for url in image_urls:
-            item = await client.post(
-                f"{ig_user_id}/media",
-                {"image_url": url, "is_carousel_item": "true"},
+            item_id = await _create_container(
+                client, ig_user_id, {"image_url": url, "is_carousel_item": "true"}
             )
-            item_id = str(item.get("id", ""))
-            if await _wait_for_container(client, item_id) != "FINISHED":
-                return {"error": f"image non traitée : {url}"}
+            if (status := await _wait_for_container(client, item_id)) != "FINISHED":
+                raise OperationError(f"image du carrousel non traitée (statut {status}) : {url}")
             children.append(item_id)
-        container = await client.post(
-            f"{ig_user_id}/media",
-            {"media_type": "CAROUSEL", "children": ",".join(children),
-             "caption": caption},
+        container_id = await _create_container(
+            client,
+            ig_user_id,
+            {"media_type": "CAROUSEL", "children": ",".join(children), "caption": caption},
         )
-        container_id = str(container.get("id", ""))
-        status = await _wait_for_container(client, container_id)
-        if status != "FINISHED":
-            return {"error": f"carrousel non prêt (statut {status})",
-                    "container_id": container_id}
-        published = await client.post(
-            f"{ig_user_id}/media_publish", {"creation_id": container_id}
-        )
-        return {"published": published, "children": children}
+        result = await _publish_container(client, ig_user_id, container_id)
+        result["children"] = children
+        return result
 
     @mcp.tool()
     async def ig_publish_carousel_from_files(
@@ -430,15 +483,14 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
         d'héberger les images ailleurs avant de publier.
         """
         client.require_writes("ig_publish_carousel_from_files")
-        if not 2 <= len(file_paths) <= 10:
-            return {"error": "un carrousel Instagram accepte entre 2 et 10 images"}
+        _check_carousel_size(len(file_paths))
         token = await client.page_token(page_id)
         image_urls: list[str] = []
         uploaded_photo_ids: list[str] = []
         for file_path in file_paths:
             uploaded = await _upload_unpublished_photo(client, page_id, file_path, token)
-            if not uploaded.get("url"):
-                return {"error": f"téléversement échoué : {file_path}", "detail": uploaded}
+            if not uploaded["url"]:
+                raise OperationError(f"URL CDN introuvable pour la photo téléversée ({file_path})")
             image_urls.append(uploaded["url"])
             uploaded_photo_ids.append(uploaded["id"])
         result = await ig_publish_carousel(ig_user_id, image_urls, caption)
@@ -453,10 +505,16 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
         cover_url: str | None = None,
         share_to_feed: bool = True,
     ) -> JSONDict:
-        """Publie un reel Instagram depuis une URL vidéo publique (MP4)."""
+        """Publie un reel Instagram depuis une URL vidéo publique (MP4).
+
+        L'encodage peut dépasser le délai d'attente : l'erreur donne alors le
+        `container_id`, à suivre avec `ig_container_status` puis à publier avec
+        `ig_publish_container`.
+        """
         client.require_writes("ig_publish_reel")
-        container = await client.post(
-            f"{ig_user_id}/media",
+        container_id = await _create_container(
+            client,
+            ig_user_id,
             {
                 "media_type": "REELS",
                 "video_url": video_url,
@@ -465,16 +523,9 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
                 "share_to_feed": "true" if share_to_feed else "false",
             },
         )
-        container_id = str(container.get("id", ""))
-        status = await _wait_for_container(client, container_id, _MAX_VIDEO_STATUS_POLLS)
-        if status != "FINISHED":
-            return {"error": f"vidéo non prête (statut {status})",
-                    "container_id": container_id,
-                    "hint": "relance ig_container_status : l'encodage peut être long"}
-        published = await client.post(
-            f"{ig_user_id}/media_publish", {"creation_id": container_id}
+        return await _publish_container(
+            client, ig_user_id, container_id, _MAX_VIDEO_STATUS_POLLS
         )
-        return {"published": published, "container_id": container_id}
 
     @mcp.tool()
     async def ig_publish_reel_from_file(
@@ -492,29 +543,55 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
         (`page_id`), ce qui produit une URL source réutilisée pour l'ingestion
         Instagram — sans hébergement externe. Cette vidéo intermédiaire est
         ensuite supprimée, sauf si `keep_fb_video=True`.
+
+        Si Instagram traite encore la vidéo au-delà du délai d'attente, la vidéo
+        intermédiaire est conservée (Instagram peut encore la lire) et l'erreur
+        indique comment finir la publication.
         """
         client.require_writes("ig_publish_reel_from_file")
         token = await client.page_token(page_id)
         uploaded = await _upload_page_video(client, page_id, file_path, token)
-        if not uploaded.get("url"):
-            return {"error": "téléversement échoué ou URL introuvable", "detail": uploaded}
-        result: JSONDict = await ig_publish_reel(
-            ig_user_id, uploaded["url"], caption, cover_url, share_to_feed
-        )
-        result["uploaded_fb_video"] = uploaded["id"]
+        video_id = uploaded["id"]
+        try:
+            video = await _wait_for_page_video_source(client, video_id, token)
+            result = await ig_publish_reel(
+                ig_user_id, video["source"], caption, cover_url, share_to_feed
+            )
+        except Exception as exc:
+            if isinstance(exc, ContainerNotReadyError) and exc.still_processing:
+                # Instagram ingère peut-être encore la vidéo : sa source doit rester en ligne.
+                raise OperationError(
+                    f"{exc}. Vidéo intermédiaire {video_id} conservée pour l'ingestion : "
+                    "supprime-la avec delete_page_post une fois le reel publié."
+                ) from exc
+            if not keep_fb_video:
+                await _delete_intermediate_video(client, video_id, token)
+            raise
+        result["uploaded_fb_video"] = video_id
         if not keep_fb_video:
-            try:
-                await client.delete(str(uploaded["id"]), token=token)
-                result["uploaded_fb_video_deleted"] = True
-            except Exception as exc:  # noqa: BLE001 - nettoyage best-effort
-                result["uploaded_fb_video_deleted"] = False
-                result["cleanup_error"] = str(exc)
+            result.update(await _delete_intermediate_video(client, video_id, token))
         return result
 
     @mcp.tool()
     async def ig_container_status(container_id: str) -> JSONDict:
         """Vérifie l'état d'un conteneur Instagram en cours de traitement."""
         return await client.get(container_id, {"fields": "status_code,status"})
+
+    @mcp.tool()
+    async def ig_publish_container(ig_user_id: str, container_id: str) -> JSONDict:
+        """Publie un conteneur Instagram déjà créé, une fois son traitement terminé.
+
+        Reprise après un délai dépassé (reel long à encoder) : suivre le conteneur
+        avec `ig_container_status`, puis le publier ici dès qu'il est `FINISHED`.
+        """
+        client.require_writes("ig_publish_container")
+        status = await _container_status(client, container_id)
+        if status != "FINISHED":
+            raise ContainerNotReadyError(container_id, status or "INCONNU")
+        published = await client.post(
+            f"{ig_user_id}/media_publish", {"creation_id": container_id}
+        )
+        return {"published": published, "container_id": container_id}
 
     @mcp.tool()
     async def ig_reply_to_comment(comment_id: str, message: str) -> JSONDict:

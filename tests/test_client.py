@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import httpx
 import pytest
 import respx
@@ -26,13 +28,46 @@ async def test_missing_token_raises():
 
 
 @respx.mock
-async def test_get_injects_token(client):
+async def test_get_sends_token_in_authorization_header(client):
     route = respx.get(f"{GRAPH_API_BASE}/me").mock(
         return_value=httpx.Response(200, json={"id": "42", "name": "LawMaster"})
     )
     data = await client.get("me", {"fields": "id,name"})
     assert data["name"] == "LawMaster"
-    assert "access_token=fake-token" in str(route.calls[0].request.url)
+    assert route.calls[0].request.headers["Authorization"] == "Bearer fake-token"
+
+
+@respx.mock
+async def test_token_never_appears_in_urls_or_logs(client, caplog):
+    """Régression : le token passé dans l'URL finissait dans les logs INFO de httpx."""
+    caplog.set_level(logging.INFO, logger="httpx")
+    # Meta renvoie des URLs `paging.next` qui embarquent le token.
+    next_url = f"{GRAPH_API_BASE}/me/posts_page2?access_token=fake-token&after=abc"
+    respx.get(f"{GRAPH_API_BASE}/me/posts").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"id": "1"}], "paging": {"next": next_url}}
+        )
+    )
+    respx.get(f"{GRAPH_API_BASE}/me/posts_page2").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "2"}]})
+    )
+    respx.post(f"{GRAPH_API_BASE}/me/feed").mock(
+        return_value=httpx.Response(200, json={"id": "1"})
+    )
+    respx.delete(f"{GRAPH_API_BASE}/1").mock(
+        return_value=httpx.Response(200, json={"success": True})
+    )
+
+    rows = await client.paginate("me/posts")
+    await client.post("me/feed", {"message": "hello"})
+    await client.delete("1")
+
+    assert [r["id"] for r in rows] == ["1", "2"]
+    assert "HTTP Request" in caplog.text  # les logs httpx sont bien capturés
+    assert "fake-token" not in caplog.text
+    for call in respx.calls:
+        assert "fake-token" not in str(call.request.url)
+        assert call.request.headers["Authorization"] == "Bearer fake-token"
 
 
 @respx.mock
@@ -71,6 +106,44 @@ async def test_paginate_respects_max_pages(client):
     )
     rows = await client.paginate("me/posts", max_pages=3)
     assert len(rows) == 3
+
+
+@respx.mock
+async def test_paginate_raises_when_a_following_page_fails(client):
+    """Régression : une page suivante en erreur tronquait le résultat sans le signaler."""
+    page2 = f"{GRAPH_API_BASE}/me/posts_page2"
+    respx.get(f"{GRAPH_API_BASE}/me/posts").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"id": "1"}], "paging": {"next": page2}}
+        )
+    )
+    respx.get(page2).mock(
+        return_value=httpx.Response(
+            429, json={"error": {"message": "rate limit", "type": "OAuthException"}}
+        )
+    )
+    with pytest.raises(GraphAPIError, match="rate limit"):
+        await client.paginate("me/posts")
+
+
+@respx.mock
+async def test_paginate_stops_once_max_items_are_collected(client):
+    """Régression : la pagination chargeait jusqu'à 10 pages, quel que soit le besoin."""
+    respx.get(f"{GRAPH_API_BASE}/me/posts").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [{"id": "1"}, {"id": "2"}, {"id": "3"}],
+                "paging": {"next": f"{GRAPH_API_BASE}/me/posts_page2"},
+            },
+        )
+    )
+    page2 = respx.get(f"{GRAPH_API_BASE}/me/posts_page2").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "4"}]})
+    )
+    rows = await client.paginate("me/posts", max_items=2)
+    assert [r["id"] for r in rows] == ["1", "2"]
+    assert not page2.called
 
 
 async def test_writes_blocked_by_default(client):

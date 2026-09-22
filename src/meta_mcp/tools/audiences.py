@@ -29,6 +29,7 @@ from ..constants import (
     AUDIENCE_SCHEMAS,
     FB_FANS_BREAKDOWNS,
 )
+from ..errors import ToolInputError
 
 JSONDict = dict[str, Any]
 
@@ -49,6 +50,16 @@ def normalize_and_hash(value: str, schema: str) -> str:
     return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
 
 
+def _hash_values(schema: str, values: list[str]) -> list[list[str]]:
+    """Valide le schéma, puis normalise et hache les valeurs non vides."""
+    if schema not in AUDIENCE_SCHEMAS:
+        raise ToolInputError(f"schema doit être parmi {list(AUDIENCE_SCHEMAS)}")
+    hashed = [[normalize_and_hash(v, schema)] for v in values if v.strip()]
+    if not hashed:
+        raise ToolInputError("aucune valeur fournie")
+    return hashed
+
+
 def register(mcp: MCPServer, client: MetaClient) -> None:
     """Enregistre les outils audiences sur le serveur MCP."""
 
@@ -61,7 +72,7 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
         Renvoie le nombre d'abonnés par segment, trié du plus grand au plus petit.
         """
         if breakdown not in FB_FANS_BREAKDOWNS:
-            return {"error": f"breakdown doit être parmi {list(FB_FANS_BREAKDOWNS)}"}
+            raise ToolInputError(f"breakdown doit être parmi {list(FB_FANS_BREAKDOWNS)}")
         metric = FB_FANS_BREAKDOWNS[breakdown]
         token = await client.page_token(page_id)
         data = await client.get(
@@ -134,8 +145,9 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
         audiences = await client.paginate(
             f"{ad_account_id}/customaudiences",
             {"fields": AUDIENCE_FIELDS, "limit": min(limit, 100)},
+            max_items=limit,
         )
-        return {"count": len(audiences), "audiences": audiences[:limit]}
+        return {"count": len(audiences), "audiences": audiences}
 
     @mcp.tool()
     async def get_custom_audience(audience_id: str) -> JSONDict:
@@ -180,11 +192,7 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
         dont les personnes ont été informées.
         """
         client.require_writes("add_users_to_audience")
-        if schema not in AUDIENCE_SCHEMAS:
-            return {"error": f"schema doit être parmi {list(AUDIENCE_SCHEMAS)}"}
-        if not values:
-            return {"error": "aucune valeur fournie"}
-        hashed = [[normalize_and_hash(v, schema)] for v in values if v.strip()]
+        hashed = _hash_values(schema, values)
         payload = {"schema": [schema], "data": hashed}
         result = await client.post(
             f"{audience_id}/users",
@@ -205,9 +213,7 @@ def register(mcp: MCPServer, client: MetaClient) -> None:
         Mêmes règles de hachage que `add_users_to_audience`.
         """
         client.require_writes("remove_users_from_audience")
-        if schema not in AUDIENCE_SCHEMAS:
-            return {"error": f"schema doit être parmi {list(AUDIENCE_SCHEMAS)}"}
-        hashed = [[normalize_and_hash(v, schema)] for v in values if v.strip()]
+        hashed = _hash_values(schema, values)
         payload = {"schema": [schema], "data": hashed}
         result = await client.delete(
             f"{audience_id}/users",
